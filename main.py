@@ -54,8 +54,12 @@ class Assistant:
             state = "работает" if self.llama.is_ready() else "остановлен"
             engine = self.voice.engine or "нет"
             autostart = "вкл" if self.config.autostart_llm else "выкл"
+            thinking = "выкл"
+            if self.config.thinking:
+                budget = self.config.thinking_budget
+                thinking = "вкл, без лимита" if budget < 0 else f"вкл, {budget} ток."
             print(f"\n[сервер {state}] модель: {self.config.model or 'не выбрана'}")
-            print(f"голос: {engine} | авто-старт LLM: {autostart}")
+            print(f"голос: {engine} | авто-старт LLM: {autostart} | thinking: {thinking}")
             print("1 модель | 2 запуск | 3 стоп | 4 чат | 5 лог | 6 голос")
             print("7 озвучка | 8 авто-старт LLM | 9 настройка | 0 выход")
             try:

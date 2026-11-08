@@ -5,5 +5,9 @@
     "model": "models/piper/ru_RU-irina-medium.onnx"
   },
   "autostart_llm": false,
+  "context_size": 8192,
+  "thinking": false,
+  "thinking_budget": 128,
+  "memory_turns": 5,
   "setup_done": false
 }

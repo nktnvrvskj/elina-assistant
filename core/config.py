@@ -13,7 +13,8 @@ class Config:
         "Отвечай сразу по существу.\n"
         "Не показывай ход рассуждений.\n"
         "Не пиши длинных вступлений.\n"
-        "Обычно отвечай 1-3 предложениями."
+        "Обычно отвечай 1-3 предложениями.\n"
+        "Ты ассистент тебя завут Элина"
     )
 
     def __init__(self):
@@ -28,6 +29,10 @@ class Config:
         self.voice_model = None
         self.autostart_llm = False
         self.setup_done = False
+        self.context_size = 8192
+        self.thinking = False
+        self.thinking_budget = 128
+        self.memory_turns = 5
         self.load()
 
     @property
@@ -47,6 +52,19 @@ class Config:
         self.voice_model = voice.get("model") or None
         self.autostart_llm = bool(data.get("autostart_llm"))
         self.setup_done = bool(data.get("setup_done"))
+        try:
+            self.context_size = int(data.get("context_size") or 8192)
+        except (TypeError, ValueError):
+            self.context_size = 8192
+        self.thinking = bool(data.get("thinking"))
+        try:
+            self.thinking_budget = int(data.get("thinking_budget", 128))
+        except (TypeError, ValueError):
+            self.thinking_budget = 128
+        try:
+            self.memory_turns = max(0, int(data.get("memory_turns", 5)))
+        except (TypeError, ValueError):
+            self.memory_turns = 5
 
     def save(self):
         """Пишет config.json; tools и mcp остаются в tools.json."""
@@ -63,6 +81,10 @@ class Config:
             "voice": voice,
             "autostart_llm": self.autostart_llm,
             "setup_done": self.setup_done,
+            "context_size": self.context_size,
+            "thinking": self.thinking,
+            "thinking_budget": self.thinking_budget,
+            "memory_turns": self.memory_turns,
         })
         self._write(self.config_file, data)
 

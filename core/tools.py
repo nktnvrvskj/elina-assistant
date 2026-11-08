@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.mcp import McpError, McpServer, load_servers
+from core.memory import Memory
 
 WEEKDAYS = ("понедельник", "вторник", "среда", "четверг",
             "пятница", "суббота", "воскресенье")
@@ -33,12 +35,27 @@ class Tool:
 
     def __init__(self, name: str, description: str,
                  params: tuple[str, ...], func: Callable[[dict], str],
-                 source: str = "встроенный") -> None:
+                 source: str = "встроенный", schema: dict | None = None) -> None:
         self.name = name
         self.description = description
         self.params = params
         self.func = func
         self.source = source
+        self.schema = schema or {
+            "type": "object",
+            "properties": {param: {"type": "string"} for param in params},
+            "required": list(params),
+        }
+
+    def to_openai(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.schema,
+            },
+        }
 
     def call(self, arguments: dict | None) -> str:
         arguments = dict(arguments or {})
@@ -80,6 +97,19 @@ def _coerce(value, annotation):
     return value
 
 
+_TYPE_NAMES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+def _function_schema(func) -> dict:
+    properties = {}
+    required = []
+    for name, param in inspect.signature(func).parameters.items():
+        properties[name] = {"type": _TYPE_NAMES.get(param.annotation, "string")}
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    return {"type": "object", "properties": properties, "required": required}
+
+
 def _from_function(name: str, description: str, func) -> Tool:
     signature = inspect.signature(func)
     params = tuple(signature.parameters)
@@ -94,7 +124,8 @@ def _from_function(name: str, description: str, func) -> Tool:
                 )
         return str(func(**kwargs))
 
-    return Tool(name, description, params, call, source="tools/")
+    return Tool(name, description, params, call, source="tools/",
+                schema=_function_schema(func))
 
 
 def tool(name: str | None = None, description: str | None = None):
@@ -136,6 +167,16 @@ def load_user_tools(folder: Path) -> tuple[list[Tool], dict[str, str]]:
         except Exception as error:
             errors[path.name] = f"{type(error).__name__}: {error}"
     return list(_USER_TOOLS.values()), errors
+
+
+def _project_root(config) -> Path:
+    root = getattr(config, "root", None)
+    if root:
+        return Path(root)
+    config_file = getattr(config, "config_file", None)
+    if config_file:
+        return Path(config_file).parent
+    return Path(__file__).resolve().parent.parent
 
 
 def _read_json(path) -> dict:
@@ -196,6 +237,71 @@ def _get_time() -> str:
             f"({WEEKDAYS[now.tm_wday]})")
 
 
+def _status_ru(status: str) -> str:
+    return {
+        "Charging": "заряжается",
+        "Discharging": "разряжается",
+        "Full": "заряжена",
+        "Not charging": "не заряжается",
+    }.get(status, status or "статус неизвестен")
+
+
+def _battery_windows() -> str:
+    """Заряд батареи через PowerShell/CIM."""
+    mapping = {
+        "1": "разряжается", "2": "не заряжается", "3": "заряжена",
+        "6": "заряжается", "7": "заряжается", "8": "заряжается",
+        "9": "заряжается",
+    }
+
+    def query(field):
+        try:
+            done = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"(Get-CimInstance Win32_Battery).{field}"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return [line.strip() for line in (done.stdout or "").splitlines()
+                if line.strip()]
+
+    capacities = query("EstimatedChargeRemaining")
+    statuses = query("BatteryStatus")
+    if not capacities:
+        return "батарея не найдена (похоже, это не ноутбук)"
+
+    parts = []
+    for index, capacity in enumerate(capacities):
+        status = statuses[index] if index < len(statuses) else ""
+        parts.append(f"{capacity}% ({mapping.get(status, 'статус неизвестен')})")
+    return ", ".join(parts)
+
+
+def _battery() -> str:
+    """Заряд батареи с состоянием (Windows через CIM, Linux через sysfs)."""
+    if os.name == "nt":
+        return _battery_windows()
+
+    devices = []
+    for folder in sorted(Path("/sys/class/power_supply").glob("BAT*")):
+        try:
+            capacity = int((folder / "capacity").read_text().strip())
+            status = (folder / "status").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        devices.append((capacity, status))
+
+    if not devices:
+        return "батарея не найдена (похоже, это не ноутбук)"
+    if len(devices) == 1:
+        capacity, status = devices[0]
+        return f"{capacity}% ({_status_ru(status)})"
+    average = round(sum(capacity for capacity, _ in devices) / len(devices))
+    parts = ", ".join(f"{c}% ({_status_ru(s)})" for c, s in devices)
+    return f"в среднем {average}%: {parts}"
+
+
 def _open_url(url: str) -> str:
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
@@ -212,6 +318,8 @@ class Tools:
 
     def __init__(self, config=None) -> None:
         self.config = config
+        self.root = _project_root(config)
+        self.memory = Memory(self.root / "memory.json")
         data = _load_json(config)
         self.settings = data.get("tools") if isinstance(data.get("tools"), dict) else {}
         self._mcp: dict[str, McpServer] = load_servers(data.get("mcp"))
@@ -226,13 +334,17 @@ class Tools:
         custom = self.settings.get("dir")
         if custom:
             return Path(str(custom)).expanduser()
-        return Path(__file__).resolve().parent.parent / "tools"
+        return self.root / "tools"
 
     def _make_commands(self) -> list[Tool]:
         """Инструменты-команды из tools.json (tools.commands)."""
         commands = self.settings.get("commands") or {}
+        reserved = ({tool.name for tool in self._builtin}
+                    | {tool.name for tool in self._user})
         result: list[Tool] = []
         for name, options in commands.items():
+            if name in reserved:
+                continue
             if isinstance(options, str):
                 options = {"run": options}
             if not isinstance(options, dict):
@@ -273,6 +385,12 @@ class Tools:
                  ("name",), lambda a: self._open_app(a.get("name", ""))),
             Tool("open_url", "открыть сайт в браузере",
                  ("url",), lambda a: _open_url(a.get("url", ""))),
+            Tool("battery", "заряд батареи и состояние (заряжается/разряжается)",
+                 (), lambda a: _battery()),
+            Tool("remember", "запомнить факт о пользователе (имя, город, животные)",
+                 ("fact",), lambda a: self.memory.add(a.get("fact", ""))),
+            Tool("forget", "забыть факт о пользователе по части текста",
+                 ("fact",), lambda a: self.memory.forget(a.get("fact", ""))),
         ]
 
     def _open_app(self, name: str) -> str:
@@ -290,11 +408,18 @@ class Tools:
         if command is None:
             return f"нет программы «{name}». Доступны: {', '.join(apps)}"
         try:
-            subprocess.Popen(
-                shlex.split(command),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            if os.name == "nt":
+                subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    shlex.split(command),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
         except (OSError, ValueError) as error:
             return f"не смог запустить «{name}»: {error}"
         return f"запустил «{name}»"
@@ -312,13 +437,16 @@ class Tools:
                 self._mcp_errors[name] = str(error)
                 continue
             for item in listed:
-                properties = ((item.get("inputSchema") or {}).get("properties") or {})
+                schema = dict(item.get("inputSchema") or {})
+                schema.setdefault("type", "object")
+                properties = schema.get("properties") or {}
                 tools.append(Tool(
                     f"{name}.{item['name']}",
                     item.get("description") or f"инструмент {name}",
                     tuple(properties),
                     (lambda args, srv=server, tool=item["name"]:
                      srv.call_tool(tool, args)),
+                    schema=schema,
                 ))
         self._mcp_tools = tools
         return tools
@@ -330,27 +458,40 @@ class Tools:
     def names(self) -> set[str]:
         return {tool.name for tool in self.specs()}
 
+    def schemas(self) -> list[dict]:
+        """Описания инструментов для нативного вызова в llama-server."""
+        return [tool.to_openai() for tool in self.specs()]
+
     def call(self, name: str, arguments: dict | None = None) -> str:
+        arguments = dict(arguments or {})
         for tool in self.specs():
             if tool.name == name:
                 try:
-                    return str(tool.call(arguments))
+                    result = str(tool.call(arguments))
                 except McpError as error:
-                    return f"ошибка инструмента: {error}"
+                    result = f"ошибка инструмента: {error}"
                 except Exception as error:
-                    return f"ошибка инструмента: {error}"
-        return f"неизвестный инструмент «{name}»"
+                    result = f"ошибка инструмента: {error}"
+                self._log(name, arguments, result)
+                return result
 
-    def hint(self) -> str:
-        """Дополнительный текст для системного промпта."""
-        lines = [tool.prompt_line() for tool in self.specs()]
-        if self._mcp_errors:
-            lines.append("Недоступные MCP-серверы: " + ", ".join(
-                f"{name} ({error})" for name, error in self._mcp_errors.items()))
-        if self._tool_errors:
-            lines.append("Ошибки в своих инструментах: " + ", ".join(
-                f"{name} ({error})" for name, error in self._tool_errors.items()))
-        return "\n".join(lines)
+        result = f"неизвестный инструмент «{name}»"
+        self._log(name, arguments, result)
+        return result
+
+    def _log(self, name: str, arguments: dict, result: str) -> None:
+        """Журнал вызовов, чтобы можно было проверить, откуда взялось число."""
+        try:
+            path = self.root / "tools.log"
+            if path.exists() and path.stat().st_size > 512_000:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                path.write_text("\n".join(lines[-200:]) + "\n", encoding="utf-8")
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            args = json.dumps(arguments, ensure_ascii=False)
+            with open(path, "a", encoding="utf-8") as file:
+                file.write(f"{stamp} {name} {args} -> {result}\n")
+        except OSError:
+            pass
 
     def close(self) -> None:
         for server in self._mcp.values():

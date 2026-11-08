@@ -16,7 +16,7 @@ class Llama:
     # Флаги llama.cpp меняются между версиями: сначала новые, потом старые,
     # в конце самый простой набор.
     FLAG_VARIANTS = (
-        ("-fa", "on", "--load-mode", "mmap+mlock", "--reasoning", "off"),
+        ("-fa", "on", "--load-mode", "mmap+mlock"),
         ("--flash-attn", "--mlock", "--no-mmap"),
         (),
     )
@@ -31,11 +31,16 @@ class Llama:
     def _arch(self):
         path = self.config.llama_path / "arch.json"
         if not path.exists():
-            raise FileNotFoundError("llama не собран — запустите bash build.sh")
+            hint = "build.ps1" if os.name == "nt" else "bash build.sh"
+            raise FileNotFoundError(f"llama не собран — запустите {hint}")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def get_binary(self):
         binary = self.config.llama_path / self._arch()["binary"]
+        if os.name == "nt" and binary.suffix.lower() != ".exe":
+            candidate = binary.with_name(binary.name + ".exe")
+            if candidate.exists():
+                binary = candidate
         if not binary.exists():
             raise FileNotFoundError(f"нет llama-server: {binary}")
         return binary
@@ -58,9 +63,11 @@ class Llama:
     def last_error(self, lines=15):
         return " | ".join(list(self._log)[-lines:])
 
-    def start(self, threads=4):
+    def start(self, threads=None):
         if self.is_running():
             raise RuntimeError("llama-server уже запущен")
+        if threads is None:
+            threads = min(os.cpu_count() or 4, 8)
 
         model_path = self.config.model_path
         if model_path is None:
@@ -75,8 +82,11 @@ class Llama:
         bin_path = self.config.llama_path / arch["arch"] / "bin"
 
         env = os.environ.copy()
-        existing = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = str(lib_path) + (":" + existing if existing else "")
+        if os.name == "nt":
+            env["PATH"] = str(bin_path) + os.pathsep + env.get("PATH", "")
+        else:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = str(lib_path) + (":" + existing if existing else "")
 
         base = [
             str(binary),
@@ -84,9 +94,21 @@ class Llama:
             "--host", self.config.host,
             "--port", self.config.port,
             "-t", str(threads),
-            "-c", "2048",
+            "-c", str(self._context_size()),
             "-b", "512",
+            "--swa-full",
         ]
+        budget = int(getattr(self.config, "thinking_budget", 128) or 0)
+        if getattr(self.config, "thinking", False) and budget != 0:
+            base += ["--reasoning", "on", "--reasoning-budget", str(budget)]
+            if budget > 0:
+                base += ["--reasoning-budget-message",
+                         "Хватит рассуждать, ответь кратко."]
+        else:
+            base += ["--reasoning", "off"]
+
+        if getattr(self.config, "thinking", False) and budget > 0:
+            self._warn_slow_thinking(budget)
 
         errors = []
         for extra in self.FLAG_VARIANTS:
@@ -143,6 +165,23 @@ class Llama:
                 announced = True
             time.sleep(0.5)
         return False
+
+    @staticmethod
+    def _warn_slow_thinking(budget):
+        import platform
+
+        machine = platform.machine().lower()
+        if machine.startswith(("aarch64", "arm", "armv7")):
+            seconds = budget / 10
+            print(f"thinking включён: на ARM при ~10 ток/с бюджет "
+                  f"{budget} токенов — это ~{seconds:.0f} с на обычный вопрос "
+                  f"(вызовы инструментов идут без рассуждений)")
+
+    def _context_size(self):
+        try:
+            return max(512, int(self.config.context_size))
+        except (TypeError, ValueError):
+            return 8192
 
     def is_running(self):
         return self.process is not None and self.process.poll() is None

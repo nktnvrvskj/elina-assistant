@@ -139,6 +139,14 @@ class Voice:
         )
 
     def _play(self, path: Path) -> bool:
+        if os.name == "nt":
+            try:
+                import winsound
+                winsound.PlaySound(str(path), winsound.SND_FILENAME)
+                return True
+            except Exception:
+                pass
+
         try:
             _play_sounddevice(path)
             return True

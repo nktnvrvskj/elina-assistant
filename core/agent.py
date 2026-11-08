@@ -1,36 +1,31 @@
-"""ИИ с инструментами: модель просит JSON-вызов, агент выполняет и
-возвращает результат обратно модели.
+"""ИИ с инструментами: LFM3 вызывает их нативно через llama-server.
 
-Инструменты описываются в системном промпте, поэтому работают с любой
-моделью в llama-server — без нативного tool-calling.
+Инструменты уходят в запрос как tools (OpenAI-совместимо), модель отвечает
+tool_calls, агент выполняет вызов и присылает результат ролью tool.
 """
 
 from __future__ import annotations
 
-import ast
 import atexit
 import json
 import re
 
 from core.tools import Tools
 
-INSTRUCTIONS = """
-У тебя есть инструменты:
-{tools}
+# Напоминание модели, когда сохранять факты о пользователе.
+MEMORY_RULE = (
+    "Если пользователь сообщает факт о себе (имя, город, животные, работа, "
+    "привычки) — сначала вызови remember и только потом отвечай. Факт "
+    "формулируй кратко, по-русски. Не говори, что запомнил, пока инструмент "
+    "не вернул результат."
+)
 
-Если для ответа нужен инструмент, ответь РОВНО одной строкой JSON, без
-пояснений, без markdown и без текста после неё:
-{{"tool": "имя_инструмента", "args": {{"параметр": "значение"}}}}
-
-В args — только параметры из описания инструмента. Если параметров нет,
-оставь пустой объект: "args": {{}}.
-
-На приветствия, «как дела», «спасибо» и болтовню инструменты не нужны —
-отвечай обычным текстом.
-
-Вызывай один инструмент за раз. Если инструмент не нужен, отвечай обычным
-текстом. Никогда не выдумывай результаты инструментов — дождись их.
-""".strip()
+# Числа не выдумываем: только из результата инструмента.
+DATA_RULE = (
+    "Если вопрос про погоду, время, заряд батареи, место на диске или uptime — "
+    "сначала вызови соответствующий инструмент. Числа бери только из его "
+    "результата, не по памяти."
+)
 
 # Короткие фразы для болтовни: инструменты тут не подключаем вообще.
 SMALLTALK = {
@@ -60,11 +55,6 @@ def _fallback(text: str) -> str:
     return "Всё хорошо! Чем помочь?"
 
 
-def _norm(name) -> str:
-    """«battery()» и «Battery» → «battery»."""
-    return re.sub(r"[^0-9a-zа-я_.]", "", str(name).lower())
-
-
 def _clean(text: str) -> str:
     """Убирает служебные теги размышлений, если модель их всё же выдала."""
     if not text:
@@ -76,98 +66,6 @@ def _clean(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
-def _repair_json(text: str) -> str:
-    """Чинит частые ошибки маленьких моделей: лишние кавычки и запятые."""
-    text = (text.replace("“", '"').replace("”", '"')
-                .replace("‘", "'").replace("’", "'"))
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-    text = re.sub(r'(?<=[0-9}\]])\s*"(?=\s*[}\]])', "", text)
-    return text
-
-
-def _loads_object(text: str) -> dict | None:
-    """Сначала обычный JSON, потом починенный, потом python-словарь."""
-    for candidate in (text, _repair_json(text)):
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            try:
-                data = ast.literal_eval(candidate)
-            except (ValueError, SyntaxError):
-                continue
-        if isinstance(data, dict):
-            return data
-    return None
-
-
-def _extract_args(text: str) -> dict:
-    """Достаёт объект args, даже если остальной JSON сломан."""
-    match = re.search(r'"(?:args|arguments)"\s*:\s*\{', text)
-    if not match:
-        return {}
-    start = match.end() - 1
-    depth = 0
-    for index in range(start, len(text)):
-        symbol = text[index]
-        if symbol == "{":
-            depth += 1
-        elif symbol == "}":
-            depth -= 1
-            if depth == 0:
-                data = _loads_object(text[start:index + 1])
-                return data if isinstance(data, dict) else {}
-    return {}
-
-
-def parse_tool_call(reply: str, names: set[str]) -> dict | None:
-    """Ищет в ответе модели JSON вида {"tool": ..., "args": {...}}."""
-    if not reply:
-        return None
-    text = reply.replace("\r", "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-
-    mapping = {_norm(name): name for name in names}
-
-    def make_call(data: dict) -> dict | None:
-        raw = data.get("tool") or data.get("name") or data.get("function")
-        real = mapping.get(_norm(raw)) if isinstance(raw, str) else None
-        if not real:
-            return None
-        args = data.get("args") or data.get("arguments")
-        if not isinstance(args, dict):
-            args = {}
-        return {"tool": real, "args": args}
-
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for index in range(start, len(text)):
-            symbol = text[index]
-            if symbol == "{":
-                depth += 1
-            elif symbol == "}":
-                depth -= 1
-                if depth == 0:
-                    data = _loads_object(text[start:index + 1])
-                    if data is not None:
-                        call = make_call(data)
-                        if call:
-                            return call
-                    break
-        start = text.find("{", start + 1)
-
-    # JSON совсем сломан, но имя инструмента видно — вытаскиваем его.
-    match = re.search(r"['\"]tool['\"]\s*:\s*['\"]([^'\"]+)", text)
-    if match:
-        real = mapping.get(_norm(match.group(1)))
-        if real:
-            return {"tool": real, "args": _extract_args(text)}
-    return None
-
-
 def _looks_like_call(reply: str) -> bool:
     """Похоже, что модель пыталась вызвать инструмент, но не смогла."""
     text = reply.replace("`", "").lstrip()
@@ -175,8 +73,39 @@ def _looks_like_call(reply: str) -> bool:
             and ("args" in text or "arguments" in text))
 
 
+def _direct_tool(text: str):
+    """Простые команды без аргументов: вызываем инструмент сразу."""
+    low = text.lower().replace("ё", "е")
+    if any(key in low for key in (
+            "который час", "сколько времени", "текущее время",
+            "какое сейчас время", "какое число", "какая дата",
+            "какой сегодня день", "какой день недели")):
+        return "get_time", {}
+    if "батаре" in low or "аккумулятор" in low or "заряд" in low:
+        return "battery", {}
+    if "uptime" in low or "аптайм" in low or "сколько работает" in low:
+        return "uptime", {}
+    if (("свободн" in low and "мест" in low) or "место на диске" in low
+            or "сколько места" in low):
+        return "disk_free", {}
+    return None
+
+
+def _arguments(raw) -> dict:
+    """Аргументы tool_calls: строка JSON или готовый словарь."""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class Agent:
-    """Диалог с моделью, которая может вызывать инструменты."""
+    """Диалог с моделью, которая умеет вызывать инструменты."""
 
     def __init__(self, config, api, tools: Tools | None = None,
                  max_steps: int = 3) -> None:
@@ -184,7 +113,10 @@ class Agent:
         self.api = api
         self.tools = tools if tools is not None else Tools(config)
         self.max_steps = max_steps
-        self._system: str | None = None
+        self.memory_turns = max(0, int(getattr(config, "memory_turns", 5)))
+        budget = int(getattr(config, "thinking_budget", 128) or 0)
+        self.thinking = bool(getattr(config, "thinking", False)) and budget != 0
+        self.history: list[dict] = []
         atexit.register(self.close)
 
     def close(self) -> None:
@@ -193,21 +125,40 @@ class Agent:
     def base_prompt(self) -> str:
         return (getattr(self.config, "SYSTEM_PROMPT", "") or "").strip()
 
-    def system_prompt(self) -> str:
-        if self._system is None:
-            base = self.base_prompt()
-            tools_hint = self.tools.hint()
-            extra = INSTRUCTIONS.format(tools=tools_hint) if tools_hint else ""
-            self._system = f"{base}\n\n{extra}".strip() if extra else base
-        return self._system
+    def system_prompt(self, with_tools: bool = True) -> str:
+        parts = [self.base_prompt()]
+        facts = self.tools.memory.prompt(with_tool=with_tools)
+        if facts:
+            parts.append(facts)
+        if with_tools:
+            parts.append(MEMORY_RULE)
+            parts.append(DATA_RULE)
+        return "\n\n".join(part for part in parts if part)
+
+    def _start_messages(self, text: str) -> list[dict]:
+        return ([{"role": "system", "content": self.system_prompt()}]
+                + self.history
+                + [{"role": "user", "content": text}])
+
+    def _remember(self, text: str, answer: str) -> None:
+        if not answer:
+            return
+        self.history.extend([
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": answer},
+        ])
+        limit = self.memory_turns * 2
+        self.history = self.history[-limit:] if limit else []
 
     def _chat(self, text: str) -> str:
         """Обычный разговор без инструментов: привет, «как дела», спасибо."""
         messages = [
-            {"role": "system", "content": self.base_prompt()},
+            {"role": "system", "content": self.system_prompt(with_tools=False)},
             {"role": "user", "content": text},
         ]
-        reply = _clean(self.api.send_messages(messages) or "")
+        messages[1:1] = self.history
+        result = self.api.complete(messages, thinking=False)
+        reply = _clean(result.get("content") or "")
         if not reply or _looks_like_call(reply):
             messages += [
                 {"role": "assistant", "content": reply},
@@ -215,56 +166,82 @@ class Agent:
                     "Ответь обычным текстом, без JSON и без вызова инструментов."
                 )},
             ]
-            reply = _clean(self.api.send_messages(messages) or "")
+            result = self.api.complete(messages)
+            reply = _clean(result.get("content") or "")
         if not reply or _looks_like_call(reply):
-            return _fallback(text)
+            reply = _fallback(text)
+        self._remember(text, reply)
         return reply
 
     def ask(self, text: str) -> str:
-        """Ответ на вопрос; при необходимости сначала вызывает инструмент."""
+        """Ответ на вопрос; при необходимости сначала вызывает инструменты."""
         if _is_smalltalk(text):
             return self._chat(text)
 
-        system = {"role": "system", "content": self.system_prompt()}
-        messages = [system, {"role": "user", "content": text}]
-        names = self.tools.names()
+        messages = self._start_messages(text)
+        tools = self.tools.schemas() or None
+        names = {item["function"]["name"] for item in tools or []}
 
-        reply = _clean(self.api.send_messages(messages) or "")
-        result = ""
-
-        for step in range(self.max_steps):
-            call = parse_tool_call(reply, names)
-            if call is None:
-                if _looks_like_call(reply):
-                    if step == 0:
-                        messages = messages + [
-                            {"role": "assistant", "content": reply},
-                            {"role": "user", "content": (
-                                "JSON не разобрался. Пришли корректный JSON "
-                                "одной строкой или ответь обычным текстом."
-                            )},
-                        ]
-                        reply = _clean(self.api.send_messages(messages) or "")
-                        continue
-                    return ("не смог разобрать вызов инструмента, "
-                            "попробуйте переформулировать")
-                return reply or result or "не смог ответить, попробуйте переформулировать"
-
-            result = self.tools.call(call["tool"], call["args"])
-
-            # В историю кладём канонический JSON, а не сырой ответ модели:
-            # у маленьких моделей там часто мусор.
-            messages = messages[:2] + [
-                {"role": "assistant", "content": json.dumps(call, ensure_ascii=False)},
-                {"role": "user", "content": (
-                    f"Результат инструмента: {result}\n\n"
-                    "Ответь пользователю коротко, по-русски, без JSON, "
-                    "опираясь на этот результат."
-                )},
+        used_tools = False
+        direct = _direct_tool(text)
+        if direct and direct[0] in names:
+            used_tools = True
+            name, args = direct
+            output = self.tools.call(name, args)
+            call_id = "direct_1"
+            messages += [
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name,
+                                 "arguments": json.dumps(args, ensure_ascii=False)},
+                }]},
+                {"role": "tool", "tool_call_id": call_id, "content": str(output)},
             ]
-            reply = _clean(self.api.send_messages(messages) or "")
 
-        if _looks_like_call(reply):
-            return ("не смог разобрать ответ модели, "
-                    "попробуйте переформулировать")
-        return reply or result or "не смог ответить, попробуйте переформулировать"
+        result = self.api.complete(messages, tools=tools, thinking=False)
+        if result.get("error") and not result.get("tool_calls"):
+            return result["error"]
+        for step in range(self.max_steps):
+            calls = result.get("tool_calls") or []
+            if not calls:
+                answer = _clean(result.get("content") or "")
+                if not answer:
+                    return result.get("error") or "не смог ответить, попробуйте переформулировать"
+
+                # Рассуждаем только для обычных вопросов: после вызова
+                # инструментов ответ уже опирается на реальные данные.
+                if self.thinking and not used_tools:
+                    better = self.api.complete(messages, thinking=True)
+                    better_answer = _clean(better.get("content") or "")
+                    if better_answer:
+                        answer = better_answer
+
+                self._remember(text, answer)
+                return answer
+
+            used_tools = True
+            messages.append({
+                "role": "assistant",
+                "content": result.get("content") or "",
+                "tool_calls": calls,
+            })
+            for index, call in enumerate(calls):
+                function = call.get("function") or {}
+                name = function.get("name") or ""
+                output = self.tools.call(name, _arguments(function.get("arguments")))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or f"call_{index}",
+                    "content": str(output),
+                })
+
+            result = self.api.complete(messages, tools=tools, thinking=False)
+
+        # Модель зациклилась на вызовах — просим ответить уже текстом.
+        result = self.api.complete(messages, tools=None, thinking=False)
+        answer = _clean(result.get("content") or "")
+        answer = (answer or result.get("error")
+                  or "не смог ответить, попробуйте переформулировать")
+        self._remember(text, answer)
+        return answer
