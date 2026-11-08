@@ -17,6 +17,10 @@ VOSK_URLS=(
 LLM_FILE="${LLM_FILE:-LFM3-1.7B-Q4_K_M.gguf}"
 LLM_URL="${LLM_URL:-https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/$LLM_FILE}"
 
+PIPER="${PIPER:-0}"
+PIPER_VOICE="ru_RU-irina-medium.onnx"
+PIPER_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium"
+
 download() {
     # download URL FILE
     if command -v curl >/dev/null 2>&1; then
@@ -38,9 +42,7 @@ download_resume() {
     fi
 }
 
-# =============================================================================
-#  Архитектура
-# =============================================================================
+# Архитектура
 case "$(uname -m)" in
     x86_64|amd64)
         ARCH="x86_64"
@@ -63,9 +65,7 @@ OUTPUT="$LLAMA/$ARCH"
 
 echo "Архитектура: $ARCH"
 
-# =============================================================================
-#  Проверка зависимостей
-# =============================================================================
+# Проверка зависимостей
 for cmd in git cmake c++ unzip "$PYTHON_BIN"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Не найдена команда: $cmd"
@@ -88,9 +88,7 @@ if [[ ! -f "$REQUIREMENTS" ]]; then
     exit 1
 fi
 
-# =============================================================================
-#  Python-окружение и зависимости (vosk, sounddevice)
-# =============================================================================
+# Python-окружение и зависимости (vosk, sounddevice)
 echo
 echo "Python: $("$PYTHON_BIN" -V 2>&1)"
 
@@ -104,6 +102,18 @@ if [[ ! -d "$VENV" ]]; then
     fi
 fi
 
+mkdir -p "$ROOT/tools"
+
+if [[ ! -f "$ROOT/config.json" && -f "$ROOT/config.example.json" ]]; then
+    cp "$ROOT/config.example.json" "$ROOT/config.json"
+    echo "Создан config.json из config.example.json"
+fi
+
+if [[ ! -f "$ROOT/tools/tools.json" && -f "$ROOT/tools.example.json" ]]; then
+    cp "$ROOT/tools.example.json" "$ROOT/tools/tools.json"
+    echo "Создан tools/tools.json из tools.example.json — впишите свои программы"
+fi
+
 STAMP="$VENV/.deps-ok"
 if [[ ! -f "$STAMP" || "$REQUIREMENTS" -nt "$STAMP" ]]; then
     echo "Ставлю Python-зависимости…"
@@ -114,9 +124,7 @@ else
     echo "Python-зависимости уже установлены"
 fi
 
-# =============================================================================
-#  Модель распознавания речи (Vosk, ~45 МБ)
-# =============================================================================
+# Модель распознавания речи (Vosk, ~45 МБ)
 echo
 if [[ -d "$MODELS/$VOSK_MODEL" ]]; then
     echo "Модель Vosk уже на месте: $MODELS/$VOSK_MODEL"
@@ -145,9 +153,27 @@ else
     echo "Модель Vosk установлена"
 fi
 
-# =============================================================================
-#  Сборка llama.cpp
-# =============================================================================
+# Озвучка (необязательно): PIPER=1 bash build.sh
+if [[ "$PIPER" == "1" ]]; then
+    echo
+    echo "Озвучка: piper-tts и русский голос"
+    if ! "$VENV/bin/python" -m pip install --quiet piper-tts; then
+        echo "piper-tts не установился — озвучка будет через espeak-ng"
+    fi
+    mkdir -p "$MODELS/piper"
+    if [[ ! -f "$MODELS/piper/$PIPER_VOICE" ]]; then
+        if download "$PIPER_URL/$PIPER_VOICE" "$MODELS/piper/$PIPER_VOICE" &&
+           download "$PIPER_URL/$PIPER_VOICE.json" "$MODELS/piper/$PIPER_VOICE.json"; then
+            echo "Голос Piper установлен"
+        else
+            echo "Не удалось скачать голос Piper: $PIPER_URL"
+        fi
+    else
+        echo "Голос Piper уже на месте: $MODELS/piper/$PIPER_VOICE"
+    fi
+fi
+
+# Сборка llama.cpp
 echo
 mkdir -p "$LLAMA/source" "$LLAMA/gguf"
 
@@ -189,9 +215,7 @@ cat > "$LLAMA/arch.json" <<EOF
 }
 EOF
 
-# =============================================================================
-#  Модель LLM (LFM3-1.7B, Q4_K_M, ~1 ГБ)
-# =============================================================================
+# Модель LLM (LFM3-1.7B, Q4_K_M, ~1 ГБ)
 echo
 if [[ -f "$LLAMA/gguf/$LLM_FILE" ]]; then
     echo "Модель LLM уже на месте: $LLAMA/gguf/$LLM_FILE"
@@ -221,8 +245,13 @@ echo "Результат: $OUTPUT"
 echo "Vosk-модель: $MODELS/$VOSK_MODEL"
 echo "LLM: $LLAMA/gguf/$LLM_FILE"
 echo "Python: $VENV"
+if [[ "$PIPER" == "1" ]]; then
+    echo "Голос: $MODELS/piper/$PIPER_VOICE"
+else
+    echo "Голос: не установлен (PIPER=1 bash build.sh)"
+fi
 echo
 echo "Дальше:"
 echo "  source .venv/bin/activate"
-echo "  python test.py"
+echo "  python main.py"
 echo "================================"

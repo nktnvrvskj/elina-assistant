@@ -228,3 +228,16 @@ llama/gguf/*.part
 
 # Vosk-модель (скачивается автоматически, ~45 МБ)
 models/
+
+# локальные настройки инструментов
+config.json
+
+# PyCharm
+.idea/
+
+# кеш MCP/npx
+.npm-cache/
+.tmp-mcp-test/
+
+# локальные настройки инструментов
+tools.json

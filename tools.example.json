@@ -1,0 +1,31 @@
+{
+  "tools": {
+    "apps": {
+      "браузер": "xdg-open https://ya.ru",
+      "блокнот": "gedit",
+      "калькулятор": "gnome-calculator",
+      "терминал": "x-terminal-emulator"
+    },
+    "commands": {
+      "uptime": {
+        "description": "сколько времени работает компьютер",
+        "run": "uptime -p"
+      },
+      "battery": {
+        "description": "заряд батареи в процентах",
+        "run": "cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1"
+      }
+    }
+  },
+  "mcp": {
+    "files": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/me/docs"
+      ],
+      "enabled": false
+    }
+  }
+}

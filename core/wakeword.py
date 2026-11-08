@@ -1,27 +1,10 @@
-"""
-core/WakeWord.py — офлайн-детектор кодового слова «Элина».
-
-Работает на Vosk (Apache-2.0): компактная русская модель (~45 МБ) целиком
-крутится на CPU, интернет нужен только один раз — чтобы её скачать.
-Никаких ключей, аккаунтов и подписок.
-
-Использование в коде:
-
-    from core.WakeWord import WakeWord
+"""Офлайн-детектор кодового слова «Элина» на Vosk.
 
     wake = WakeWord()
-    if wake.wait(timeout=30):          # ждём «Элину»
-        print("услышал")
-    text = wake.listen_command()       # «Элина, какая погода?» -> «какая погода»
+    if wake.wait(timeout=30):      # ждём «Элину»
+        text = wake.listen_command()
 
-Запуск для проверки без микрофона и без вашего кода:
-
-    python -m core.WakeWord                  # слушать микрофон, печатать ЭЛИНА
-    python -m core.WakeWord --command        # печатать распознанную команду
-    python -m core.WakeWord --wav file.wav   # прогнать аудиофайл
-    python -m core.WakeWord --list-devices   # список микрофонов
-
-Модель и зависимости ставит build.sh (см. README).
+Проверка из терминала: python -m core.wakeword
 """
 
 from __future__ import annotations
@@ -38,7 +21,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 SAMPLE_RATE = 16000
-BLOCK = 512                      # 32 мс: низкая задержка, нагрузка всё ещё копеечная
+BLOCK = 512
 MODEL_NAME = "vosk-model-small-ru-0.22"
 DEFAULT_ALIASES = ("элена", "елина", "элино", "элины")
 
@@ -46,9 +29,6 @@ ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 
 
-# ===========================================================================
-#  Модель
-# ===========================================================================
 def _looks_like_model(path: Path) -> bool:
     return path.is_dir() and (path / "am").is_dir() and (path / "conf").is_dir()
 
@@ -65,11 +45,8 @@ def find_model() -> Path:
     )
 
 
-# ===========================================================================
-#  Ресемплинг, если микрофон не умеет 16 кГц
-# ===========================================================================
 class _Resampler:
-    """Линейная интерполяция PCM int16 (без numpy)."""
+    """Линейная интерполяция PCM int16, если микрофон не умеет 16 кГц."""
 
     def __init__(self, in_rate: int, out_rate: int = SAMPLE_RATE) -> None:
         self.step = in_rate / out_rate
@@ -97,9 +74,6 @@ class _Resampler:
         return out.tobytes()
 
 
-# ===========================================================================
-#  Сопоставление текста со словом
-# ===========================================================================
 def normalize(text: str) -> str:
     text = text.lower().replace("ё", "е")
     text = re.sub(r"[^0-9a-zа-я]+", " ", text)
@@ -109,16 +83,16 @@ def normalize(text: str) -> str:
 def _similarity(candidate: str, alias: str) -> float:
     if candidate == alias:
         return 1.0
-    if len(candidate) > len(alias) and candidate.startswith(alias) \
-            and len(candidate) - len(alias) <= 3:
-        return 0.95                                   # элина -> элину/элиной
+    if (len(candidate) > len(alias) and candidate.startswith(alias)
+            and len(candidate) - len(alias) <= 3):
+        return 0.95
     if len(candidate) >= 4 and alias.startswith(candidate):
-        return 0.90                                   # недослышали: «элин»
+        return 0.90
     return SequenceMatcher(None, candidate, alias).ratio()
 
 
 def match_score(text: str, aliases) -> tuple[float, str]:
-    """Лучшее совпадение по словам, парам и тройкам («э ли на» -> «элина»)."""
+    """Лучшее совпадение по словам, парам и тройкам («э ли на» → «элина»)."""
     words = normalize(text).split()
     if not words:
         return 0.0, ""
@@ -138,9 +112,6 @@ def match_score(text: str, aliases) -> tuple[float, str]:
     return best, best_c
 
 
-# ===========================================================================
-#  Детектор
-# ===========================================================================
 class WakeWord:
     """Слушает микрофон и срабатывает на слово «Элина»."""
 
@@ -152,7 +123,9 @@ class WakeWord:
                  device: str | int | None = None,
                  verbose: bool = False) -> None:
         self.word = normalize(word)
-        self.aliases = tuple(a for a in (normalize(x) for x in (word, *aliases)) if a)
+        self.aliases = tuple(
+            a for a in (normalize(x) for x in (word, *aliases)) if a
+        )
         self.threshold = threshold
         self.cooldown = cooldown
         self.device = device
@@ -165,7 +138,6 @@ class WakeWord:
         self._model = Model(str(model_dir or find_model()))
         self._rec = KaldiRecognizer(self._model, SAMPLE_RATE)
 
-    # -- микрофон ----------------------------------------------------------
     @contextlib.contextmanager
     def _mic(self):
         """Открывает микрофон и отдаёт бесконечный поток блоков PCM 16 кГц."""
@@ -185,7 +157,8 @@ class WakeWord:
             blocksize = BLOCK * rate // SAMPLE_RATE
             resampler = _Resampler(rate, SAMPLE_RATE)
             if self.verbose:
-                print(f"ℹ  микрофон на {rate} Гц, пересчитываю в 16 кГц", file=sys.stderr)
+                print(f"ℹ  микрофон на {rate} Гц, пересчитываю в 16 кГц",
+                      file=sys.stderr)
             stream = sd.RawInputStream(samplerate=rate, blocksize=blocksize, **kwargs)
             stream.start()
 
@@ -202,7 +175,6 @@ class WakeWord:
             stream.stop()
             stream.close()
 
-    # -- распознавание -----------------------------------------------------
     def _feed(self, pcm: bytes) -> bool:
         """Скормить блок. True — только что услышали слово."""
         if self._rec.AcceptWaveform(pcm):
@@ -249,7 +221,6 @@ class WakeWord:
                 break
         return " ".join(words)
 
-    # -- публичный интерфейс ----------------------------------------------
     def wait(self, timeout: float | None = None) -> bool:
         """Блокирующе ждёт слово. False — если вышел timeout."""
         started = time.monotonic()
@@ -272,8 +243,8 @@ class WakeWord:
                        timeout: float | None = None) -> str:
         """Ждёт «Элину», затем возвращает сказанное после неё.
 
-        Понимает оба варианта: «Элина, какая погода?» и «Элина» <пауза> «какая
-        погода». Возвращает пустую строку, если после слова ничего не сказали.
+        Понимает оба варианта: «Элина, какая погода?» и «Элина» <пауза>
+        «какая погода». Возвращает пустую строку, если ничего не сказали.
         """
         started = time.monotonic()
         with self._mic() as blocks:
@@ -285,21 +256,17 @@ class WakeWord:
             else:
                 return ""
 
-            # фраза целиком: «элина какая погода» -> «какая погода»
             command = self._strip_word(self._text_after_pause(blocks, max_seconds))
             if not command:
-                # слово сказали отдельно — ждём отдельную фразу-команду
                 self._rec.Reset()
                 command = self._text_after_pause(blocks, max_seconds)
             self._rec.Reset()
             return command.strip()
 
 
-# ===========================================================================
-#  Проверка из командной строки
-# ===========================================================================
 def _read_wav(path: Path):
     """WAV 16 кГц/моно/16 бит блоками; другое — через ffmpeg."""
+    import os
     import shutil
     import subprocess
     import tempfile
@@ -314,7 +281,6 @@ def _read_wav(path: Path):
         if not shutil.which("ffmpeg"):
             raise SystemExit(f"{path.name}: нужен WAV 16 кГц/моно или ffmpeg")
         fd, name = tempfile.mkstemp(suffix=".wav")
-        import os
         os.close(fd)
         tmp = Path(name)
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
@@ -336,7 +302,7 @@ def _read_wav(path: Path):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m core.WakeWord",
+        prog="python -m core.wakeword",
         description="Офлайн-детектор слова «Элина» (Vosk).")
     parser.add_argument("--device", help="микрофон: номер или часть названия")
     parser.add_argument("--list-devices", action="store_true", help="список микрофонов")
@@ -346,7 +312,8 @@ def main(argv=None) -> int:
                         help="замерить скорость на файле (для Raspberry Pi)")
     parser.add_argument("--word", default="элина", help="другое кодовое слово")
     parser.add_argument("--threshold", type=float, default=0.82, help="порог 0…1")
-    parser.add_argument("-v", "--verbose", action="store_true", help="показывать, что слышно")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="показывать, что слышно")
     args = parser.parse_args(argv)
 
     if args.list_devices:

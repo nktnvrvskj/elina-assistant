@@ -1,0 +1,9 @@
+{
+  "model": null,
+  "voice": {
+    "engine": "auto",
+    "model": "models/piper/ru_RU-irina-medium.onnx"
+  },
+  "autostart_llm": false,
+  "setup_done": false
+}
