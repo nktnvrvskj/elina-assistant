@@ -1,2 +1,3 @@
 # elina-assistant
-elina assistant
+Тестовый образец голосового помошника
+
