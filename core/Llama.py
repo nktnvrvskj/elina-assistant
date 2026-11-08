@@ -57,9 +57,6 @@ class Llama:
             "-t", str(threads),
             "-c", "2048",  # Меньше контекст = быстрее
             "-b", "512",  # Batch size
-            "--flash-attn",  # Flash attention
-            "--mlock",  # Блокировка в RAM
-            "--no-mmap",  # Без mmap
         ]
 
         self.process = subprocess.Popen(

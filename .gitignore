@@ -222,4 +222,9 @@ __marimo__/
 #llama
 llama/*
 !llama/gguf/
+llama/gguf/*.gguf
+llama/gguf/*.part
 
+
+# Vosk-модель (скачивается автоматически, ~45 МБ)
+models/
